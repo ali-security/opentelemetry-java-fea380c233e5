@@ -1,12 +1,6 @@
 name: Build tracecontext testsuite
 
 on:
-  push:
-    paths:
-      - 'integration-tests/tracecontext/docker/**'
-      - '.github/workflows/build-tracecontext-testsuite.yaml'
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:

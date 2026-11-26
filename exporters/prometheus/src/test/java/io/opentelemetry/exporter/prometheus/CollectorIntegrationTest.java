@@ -60,7 +60,7 @@ import org.testcontainers.utility.DockerImageName;
 class CollectorIntegrationTest {
 
   private static final String COLLECTOR_IMAGE =
-      "ghcr.io/open-telemetry/opentelemetry-java/otel-collector";
+      "otel/opentelemetry-collector-contrib:0.98.0";
   private static final Integer COLLECTOR_HEALTH_CHECK_PORT = 13133;
 
   private static int prometheusPort;

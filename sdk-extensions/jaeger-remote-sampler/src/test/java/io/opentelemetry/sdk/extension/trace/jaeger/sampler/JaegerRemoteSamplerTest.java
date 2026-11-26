@@ -44,6 +44,8 @@ import org.awaitility.core.ThrowingRunnable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -199,6 +201,10 @@ class JaegerRemoteSamplerTest {
   }
 
   @Test
+  @DisabledOnOs(
+      value = OS.MAC,
+      architectures = "x86_64",
+      disabledReason = "TLS handshake to the mock server never completes with x64 JDK 8 under Rosetta")
   void tlsViaSslContext() throws Exception {
     X509TrustManager trustManager = TlsUtil.trustManager(certificate.certificate().getEncoded());
 

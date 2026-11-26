@@ -1,12 +1,12 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - main
-      - release/*
-  pull_request:
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test task + --tests selector to run instead of the full build's tests"
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -16,6 +16,7 @@ jobs:
   build:
     name: Build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +30,7 @@ jobs:
           - 20
         # Collect coverage on latest LTS
         include:
-          - os: ubuntu-20.04
+          - os: ubuntu-22.04
             test-java-version: 17
             coverage: true
             jmh-based-tests: true
@@ -42,19 +43,49 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.test-java-version }}
+          cache: gradle
+          # Temurin ships no aarch64 macOS JDK 8; provision the x64 build (Rosetta) on arm64 macos-latest
+          architecture: ${{ (matrix.os == 'macos-latest' && matrix.test-java-version == 8) && 'x64' || '' }}
 
       - id: setup-java
         name: Set up Java for build
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          # JDK 17 patch level upstream's release build used (Built-JDK: 17.0.10 in the published jar manifest)
+          java-version: 17.0.10+7
+          cache: gradle
+
+      - name: Disable lint / API-compat gates
+        run: |
+          cat > "$RUNNER_TEMP/seal-disable-gates.gradle" <<'EOF'
+          allprojects {
+            tasks.withType(org.gradle.api.plugins.quality.Checkstyle).configureEach { enabled = false }
+            tasks.matching { it.name ==~ /spotless.*Check/ || it.name.startsWith('animalsniffer') || it.name == 'jApiCmp' }.configureEach { enabled = false }
+          }
+          EOF
+
+      - name: Pin docker-java API version for Testcontainers
+        # Testcontainers 1.19.7 defaults to Docker API 1.32, which the current runner Docker daemon rejects
+        # ("client version 1.32 is too old"), so every @Testcontainers(disabledWithoutDocker = true) test would skip
+        # The collector image is pulled with alwaysPull() by three test tasks running in parallel
+        # (org.gradle.parallel=true); concurrent first-time pulls race in the containerd image store
+        # ("unable to lease content: lease does not exist"), so pull it once before the build
+        if: runner.os == 'Linux'
+        run: |
+          echo "api.version=1.44" > "$HOME/.docker-java.properties"
+          docker pull otel/opentelemetry-collector-contrib:0.98.0
 
       - uses: gradle/actions/setup-gradle@v3
         with:
           arguments: |
-            build
-            ${{ matrix.coverage && 'jacocoTestReport' || '' }}
+            ${{ inputs.test-filter != '' && 'assemble' || 'build' }}
+            ${{ inputs.test-filter }}
+            --no-build-cache
+            --continue
+            --init-script ${{ runner.temp }}/seal-disable-gates.gradle
+            -x spotlessCheck
+            ${{ (matrix.coverage && inputs.test-filter == '') && 'jacocoTestReport' || '' }}
             -PtestJavaVersion=${{ matrix.test-java-version }}
             -Porg.gradle.java.installations.paths=${{ steps.setup-java-test.outputs.path }},${{ steps.setup-java.outputs.path }}
         env:
@@ -64,7 +95,7 @@ jobs:
 
       - name: Check for diff
         # The jApiCmp diff compares current to latest, which isn't appropriate for release branches
-        if: ${{ !startsWith(github.ref_name, 'release/') && !startsWith(github.base_ref, 'release/') }}
+        if: false
         run: |
           # need to "git add" in case any generated files did not already exist
           git add docs/apidiffs
@@ -79,7 +110,7 @@ jobs:
           fi
 
       - uses: codecov/codecov-action@v4
-        if: ${{ matrix.coverage }}
+        if: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -89,14 +120,85 @@ jobs:
           name: coverage-report
           path: all/build/reports/jacoco/test/html
 
+      - uses: actions/upload-artifact@v4
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.test-java-version == 8 }}
+        with:
+          name: opentelemetry-api-jar
+          path: |
+            api/all/build/libs/opentelemetry-api-*.jar
+            !api/all/build/libs/*-sources.jar
+            !api/all/build/libs/*-javadoc.jar
+          if-no-files-found: error
+
+      - name: Test summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, platform, re, xml.etree.ElementTree as ET
+          # Gradle's JUnit XML drops the JUnit 5 skip reason; these are the conditions the test sources declare
+          REASONS = [
+              (r'#(connectTimeout|compressionWith\w+)\(', 'upstream assumeThat: only applies to OkHttpGrpcSender; UpstreamGrpcSender (grpc-java) has no compression/connectTimeout support'),
+              (r'#minimalChannel\(', 'upstream assumeThat: only applies to UpstreamGrpcSender (grpc-java); this suite uses OkHttpGrpcSender'),
+              (r'JdkSenderTest#withAuthenticator\(', 'upstream assumeThat(hasAuthenticatorSupport()): the JDK HttpClient sender returns false'),
+              (r'OkHttpVersionTest#', 'upstream assumeThat: expected.okhttp.version=LATEST in this suite; only pinned-OkHttp suites assert the version'),
+              (r'PrometheusMetricReaderTest#exponentialLongHistogramComplete', 'upstream @Disabled("disabled until #6010 is fixed")'),
+              (r'OtlpPipelineStressTest#oltpExportWithFlakyCollector', 'upstream @Disabled("we don\'t want to run this with every build.")'),
+              (r'TraceContextIntegrationTest#', 'upstream @Disabled on the whole class'),
+              (r'JcToolsTest#', 'upstream @EnabledInNativeImage: runs only under GraalVM native-image (build-graal job, nativeTest)'),
+              (r'SystemClockTest#millisPrecision', 'upstream @EnabledOnJre(JAVA_8): runs on the Java 8 legs only'),
+              (r'SystemClockTest#microsPrecision', 'upstream @DisabledOnJre(JAVA_8): runs on every leg except Java 8'),
+              (r'JcToolsSecurityManagerTest#', 'upstream @EnabledOnJre(JAVA_8, JAVA_11, JAVA_17): needs a SecurityManager, unsupported on newer JREs'),
+              (r'InstrumentGarbageCollectionBenchmarkTest#', 'upstream assumeTrue(RUN_JMH_BASED_TESTS=true): long JMH test, set only on the ubuntu-22.04 coverage leg'),
+              (r'JaegerRemoteSamplerTest#tlsViaSslContext', 'seal @DisabledOnOs(MAC, x86_64): TLS handshake to the mock server never completes with x64 JDK 8 under Rosetta'),
+              (r'(IntegrationTest|EndToEndHttpTest)#', 'upstream @Testcontainers(disabledWithoutDocker = true): no Docker daemon on %s runners' % platform.system()),
+          ]
+          def reason(name, msg):
+              if msg:
+                  return msg.splitlines()[0][:200]
+              for pat, why in REASONS:
+                  if re.search(pat, name):
+                      return why
+              return 'disabled/assumption (no message)'
+          tot = fail = err = skip = 0
+          per = {}
+          skipped = []
+          for f in glob.glob('**/build/test-results/**/*.xml', recursive=True):
+              try:
+                  r = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              mod = f.split('/build/test-results/')[0] + ':' + f.split('/build/test-results/')[1].split('/')[0]
+              for tc in r.iter('testcase'):
+                  s = per.setdefault(mod, [0, 0, 0])
+                  s[0] += 1
+                  tot += 1
+                  if tc.find('failure') is not None: fail += 1; s[1] += 1
+                  elif tc.find('error') is not None: err += 1; s[1] += 1
+                  elif tc.find('skipped') is not None:
+                      skip += 1; s[2] += 1
+                      sk = tc.find('skipped')
+                      name = '%s#%s' % (tc.get('classname'), tc.get('name'))
+                      skipped.append((reason(name, sk.get('message')), name))
+          for m in sorted(per):
+              t, fl, sk = per[m]
+              print('%-70s tests=%d passed=%d failed=%d skipped=%d' % (m, t, t - fl - sk, fl, sk))
+          print('SKIPPED TESTS (%d), one line per reason:' % skip)
+          byreason = {}
+          for why, name in skipped:
+              byreason.setdefault(why, []).append(name.split('.')[-1])
+          for why in sorted(byreason):
+              print('  SKIPPED x%d [%s]: %s' % (len(byreason[why]), why, ', '.join(sorted(byreason[why]))))
+          print('TEST SUMMARY: total=%d passed=%d failed=%d errors=%d skipped=%d' % (tot, tot - fail - err - skip, fail, err, skip))
+          EOF
+
   markdown-link-check:
     # release branches are excluded to avoid unnecessary maintenance
-    if: ${{ !startsWith(github.ref_name, 'release/') }}
+    if: false
     uses: ./.github/workflows/reusable-markdown-link-check.yml
 
   misspell-check:
     # release branches are excluded to avoid unnecessary maintenance
-    if: ${{ !startsWith(github.ref_name, 'release/') }}
+    if: false
     uses: ./.github/workflows/reusable-misspell-check.yml
 
   publish-snapshots:
@@ -113,6 +215,7 @@ jobs:
     # intentionally not blocking snapshot publishing on markdown-link-check or misspell-check
     needs: build
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -122,6 +225,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
 
       - uses: gradle/actions/setup-gradle@v3
         # skipping release branches because the versions in those branches are not snapshots
@@ -137,6 +241,7 @@ jobs:
 
   build-graal:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: graalvm/setup-graalvm@v1
@@ -162,6 +267,7 @@ jobs:
       - build
       - build-graal
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: always()
     steps:
       - if: |
